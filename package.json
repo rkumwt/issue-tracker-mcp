@@ -1,6 +1,6 @@
 {
   "name": "issue-tracker-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "An MCP (Model Context Protocol) server that lets LLMs create, triage and report on issues. Runs locally over stdio or remotely on AWS Lambda.",
   "license": "MIT",
   "private": true,
@@ -15,7 +15,9 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run --passWithNoTests",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "dev:stdio": "tsx src/stdio.ts",
+    "start:stdio": "node dist/stdio.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
@@ -33,5 +35,8 @@
     "typescript": "~5.9",
     "typescript-eslint": "^8.73.0",
     "vitest": "^5.1.1"
+  },
+  "bin": {
+    "issue-tracker-mcp": "dist/stdio.js"
   }
 }

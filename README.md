@@ -11,8 +11,8 @@ MCP Inspector) and **remotely over Streamable HTTP** on AWS Lambda, backed by SQ
 | Phase | Scope                                                        | Status  |
 | ----- | ------------------------------------------------------------ | ------- |
 | 1     | Project setup, data model, SQLite repository                 | ✅ Done |
-| 2     | MCP tools, resources, prompts + stdio transport              | ⏳ Next |
-| 3     | Vitest tests + MCP Inspector instructions                    | ⏳      |
+| 2     | MCP tools, resources, prompts + stdio transport              | ✅ Done |
+| 3     | Vitest tests + MCP Inspector instructions                    | ⏳ Next |
 | 4     | Streamable HTTP transport, API-key auth, logging, rate limit | ⏳      |
 | 5     | DynamoDB repository, Lambda handler, IaC, CI/CD              | ⏳      |
 
@@ -65,8 +65,21 @@ transport is used. Only the wiring differs.
 
 ```text
 src/
+  server.ts                  # createServer(): registers tools, resources, prompts (transport-agnostic)
+  stdio.ts                   # stdio entry point (Claude Desktop, MCP Inspector)
+  context.ts                 # AppContext { repo, now } injected everywhere
   config.ts                  # env vars → typed, validated config (fail fast)
-  models/issue.ts            # Zod schemas + derived types, limits, label helpers
+  models/
+    issue.ts                 # Zod schemas + derived types, limits, label helpers
+    workflow.ts              # status transitions + priority definitions (single source)
+  tools/
+    types.ts                 # ToolDefinition: metadata + Zod shape + handler
+    runTool.ts               # result/error → CallToolResult (isError: true)
+    schemas.ts               # shared field schemas with .describe()
+    format.ts                # description truncation for list/search output
+    createIssue.ts … deleteIssue.ts   # one file per tool
+  resources/                 # issues://summary, issues://workflow
+  prompts/                   # triage_issues, weekly_report
   db/
     IssueRepository.ts       # storage interface (the contract)
     index.ts                 # createRepository(): picks backend from STORAGE
@@ -76,10 +89,87 @@ src/
   lib/
     errors.ts                # AppError + NotFound/Validation/Conflict/Config
     ids.ts                   # short prefixed IDs (iss_…, cmt_…)
-  # coming next: server.ts, stdio.ts, http.ts, lambda.ts, tools/, resources/, prompts/
+  # coming next: http.ts (phase 4), lambda.ts (phase 5)
 tests/                       # phase 3
 infra/                       # phase 5
+.github/workflows/ci.yml     # lint, typecheck, test, build on every push / PR
 ```
+
+## How MCP works in this project
+
+MCP gives an LLM three kinds of capability. They differ by **who decides to use them**:
+
+| Primitive     | Who triggers it                               | Side effects?  | In this project                                          |
+| ------------- | --------------------------------------------- | -------------- | -------------------------------------------------------- |
+| **Tools**     | The **model** decides to call them            | Yes (some)     | 8 tools to create, read, update, comment, search, delete |
+| **Resources** | The **app / user** attaches them as context   | No (read-only) | `issues://summary`, `issues://workflow`                  |
+| **Prompts**   | The **user** picks them (like slash commands) | No             | `triage_issues`, `weekly_report`                         |
+
+### Tools
+
+| Tool            | Use it to…                                                                | Hints       |
+| --------------- | ------------------------------------------------------------------------- | ----------- |
+| `create_issue`  | track new work (search first to avoid duplicates)                         |             |
+| `get_issue`     | read one issue in full, with comments                                     | read-only   |
+| `list_issues`   | filter by status / priority / assignee / label                            | read-only   |
+| `search_issues` | find issues by words in title or description                              | read-only   |
+| `update_issue`  | change title, description, priority, assignee (`null` = unassign), labels | idempotent  |
+| `change_status` | move through the workflow; illegal moves are rejected                     | idempotent  |
+| `add_comment`   | record progress or the reason for a change                                |             |
+| `delete_issue`  | permanently delete, **only with `confirm: true`**                         | destructive |
+
+How a tool call flows:
+
+```mermaid
+sequenceDiagram
+  participant LLM as LLM (client)
+  participant SDK as McpServer (SDK)
+  participant RT as runTool()
+  participant H as tool handler
+  participant R as IssueRepository
+  LLM->>SDK: tools/call change_status {id, status}
+  SDK->>SDK: validate args with Zod (invalid → isError result)
+  SDK->>RT: validated args
+  RT->>H: handler(args, { repo, now })
+  H->>R: getIssue / updateIssue
+  R-->>H: Issue (or throws NotFoundError)
+  H-->>RT: data (or throws AppError)
+  RT-->>LLM: JSON text, or isError: true + "CONFLICT: Allowed from closed: open"
+```
+
+Every tool is a plain object (`name`, `description`, Zod `inputSchema`, `annotations`, `handler`), see
+[`src/tools/types.ts`](src/tools/types.ts). Handlers return data or throw; `runTool()` alone decides how
+results and errors look on the wire.
+
+### Status workflow
+
+```mermaid
+stateDiagram-v2
+  [*] --> open
+  open --> in_progress
+  in_progress --> open
+  open --> resolved
+  in_progress --> resolved
+  open --> closed
+  in_progress --> closed
+  resolved --> closed
+  resolved --> open: reopen
+  closed --> open: reopen
+```
+
+Defined once in [`src/models/workflow.ts`](src/models/workflow.ts). `change_status` enforces it, and
+`issues://workflow` renders it as markdown, so the docs the model reads always match the behaviour.
+
+### Prompts
+
+- **`triage_issues`** (`team?`: comma-separated usernames): loads all open issues and the current
+  workload per person, and asks the model for a priority/assignee table. It tells the model **not** to
+  apply anything until the user approves (human in the loop).
+- **`weekly_report`** (`since?`: `YYYY-MM-DD`, default Monday of this week, UTC): loads issues
+  created, resolved/closed, and still open, and asks for a short structured report.
+
+Both embed issue data inside `<issues>` blocks and tell the model to treat it as data, not
+instructions, a basic defence against prompt injection through issue text.
 
 ## Data model
 
@@ -126,25 +216,62 @@ infra/                       # phase 5
    mirrors how DynamoDB will store them and is plenty fast at this scale.
 9. **Simple search.** A case-insensitive `LIKE` over title and description. SQLite FTS5 or OpenSearch
    would be the upgrade path, but they are overkill for a team-sized tracker and would not port to DynamoDB.
+10. **Tool descriptions are prompt engineering.** Each description says _when_ to use the tool and
+    which sibling to use instead (e.g. `update_issue` points to `change_status` for status changes).
+    Every input field has `.describe()`, because that text becomes the JSON Schema the model reads.
+11. **Errors the model can act on.** Failures come back as `isError: true` results with a code and
+    a fix hint ("Allowed from closed: open"), not protocol errors, so the model can self-correct.
+    Unexpected errors return a generic message; details go to stderr only.
+12. **Token-aware output.** List and search results truncate descriptions to 200 characters and add
+    a note when the limit was hit; `get_issue` returns the full text. Tool output fills the context window.
+13. **Guardrail on destructive actions.** `delete_issue` requires `confirm: true` and is annotated
+    `destructiveHint`; its description steers the model towards closing instead.
+14. **One status path.** `update_issue` cannot change status (unknown fields are rejected), so every
+    status change goes through the workflow check in `change_status`.
+15. **Absolute default DB path.** Claude Desktop launches servers from an unpredictable working
+    directory, so the default `SQLITE_PATH` resolves to `<project>/data/issues.db`, not `./data`.
+
+**Known limitation:** there is no status history, so `weekly_report` counts an issue as "resolved this
+week" if it is currently resolved/closed and was last updated this week. A `resolvedAt` field or an
+activity log would make this exact.
 
 ## Local setup
 
 ```bash
 nvm use            # Node 22 (see .nvmrc)
 npm install
-cp .env.example .env
-npm run typecheck && npm run lint && npm run build
+npm run build
+npm run dev:stdio  # run from source with tsx (speaks MCP on stdin/stdout)
 ```
 
-The SQLite database is created automatically at `SQLITE_PATH` (default `./data/issues.db`, which is
-git-ignored) on first use. Schema migrations run on startup.
+The SQLite database is created automatically on first use (default `<project>/data/issues.db`,
+git-ignored), and schema migrations run on startup. Environment variables are passed by the MCP
+client (for example the `env` block in Claude Desktop's config) or your shell. `.env.example` lists them.
+
+| Script                | What it does                               |
+| --------------------- | ------------------------------------------ |
+| `npm run dev:stdio`   | run the stdio server from TypeScript (tsx) |
+| `npm run start:stdio` | run the compiled server (`dist/stdio.js`)  |
+| `npm run build`       | compile `src/` to `dist/`                  |
+| `npm run lint`        | ESLint (type-aware)                        |
+| `npm run typecheck`   | `tsc --noEmit` over src and tests          |
+| `npm test`            | Vitest                                     |
 
 ## Environment variables
 
-| Variable      | Default            | Description                                |
-| ------------- | ------------------ | ------------------------------------------ |
-| `STORAGE`     | `sqlite`           | `sqlite` or `dynamodb` (phase 5)           |
-| `SQLITE_PATH` | `./data/issues.db` | SQLite file path; `:memory:` for throwaway |
+| Variable      | Default                    | Description                                |
+| ------------- | -------------------------- | ------------------------------------------ |
+| `STORAGE`     | `sqlite`                   | `sqlite` or `dynamodb` (phase 5)           |
+| `SQLITE_PATH` | `<project>/data/issues.db` | SQLite file path; `:memory:` for throwaway |
 
-_Sections still to come: how MCP tools/resources/prompts work in this project, testing with MCP Inspector,
-Claude Desktop config, AWS deployment and budget alert, interview talking points._
+## CI/CD
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and pull request:
+`npm ci` → format check → lint → typecheck → test → build. It has read-only permissions and cancels
+superseded runs. Deployment to AWS is a separate workflow that runs only on `main` (phase 5).
+
+Branching follows GitHub Flow: one short-lived branch per phase (`2-mcp-tools-stdio`, …), a pull request
+into `main`, CI must pass, then squash merge.
+
+_Sections still to come: testing with MCP Inspector, Claude Desktop config, AWS deployment and budget
+alert, interview talking points._
