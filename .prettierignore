@@ -1,0 +1,5 @@
+dist/
+coverage/
+data/
+infra/cdk.out/
+package-lock.json
