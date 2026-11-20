@@ -79,10 +79,9 @@ describe('loadConfig', () => {
   });
 
   it('reads explicit values', () => {
-    expect(loadConfig({ STORAGE: 'dynamodb', SQLITE_PATH: ':memory:' })).toEqual({
-      storage: 'dynamodb',
-      sqlitePath: ':memory:',
-    });
+    expect(
+      loadConfig({ STORAGE: 'dynamodb', SQLITE_PATH: ':memory:', LOG_LEVEL: 'debug' }),
+    ).toEqual({ storage: 'dynamodb', sqlitePath: ':memory:', logLevel: 'debug' });
   });
 
   it('fails fast with a readable error on an invalid STORAGE value', () => {

@@ -6,6 +6,7 @@
  */
 import type { AppContext } from '../src/context.js';
 import { SqliteIssueRepository } from '../src/db/sqlite/SqliteIssueRepository.js';
+import { createLogger, type Logger, type LogLevel } from '../src/lib/logger.js';
 
 /** Wednesday 18 Nov 2026, 10:00 UTC (mid-week, handy for weekly-report tests). */
 export const DEFAULT_NOW = '2026-11-18T10:00:00.000Z';
@@ -30,13 +31,38 @@ export function createClock(startIso: string = DEFAULT_NOW): TestClock {
   };
 }
 
+/** A parsed log line as captured by createMemoryLogger(). */
+export interface LogEntry {
+  time: string;
+  level: LogLevel;
+  msg: string;
+  [field: string]: unknown;
+}
+
+export interface MemoryLogger {
+  logger: Logger;
+  entries: LogEntry[];
+}
+
+/** A real logger whose JSON lines are captured in memory for assertions. */
+export function createMemoryLogger(level: LogLevel = 'debug'): MemoryLogger {
+  const entries: LogEntry[] = [];
+  const logger = createLogger({
+    level,
+    write: (line) => entries.push(JSON.parse(line) as LogEntry),
+  });
+  return { logger, entries };
+}
+
 export interface TestContext extends AppContext {
   clock: TestClock;
   repo: SqliteIssueRepository;
+  logs: LogEntry[];
 }
 
 /** Fresh in-memory SQLite repository + context sharing one controllable clock. */
 export function createTestContext(clock: TestClock = createClock()): TestContext {
   const repo = SqliteIssueRepository.open(':memory:', { now: clock.now });
-  return { repo, now: clock.now, clock };
+  const { logger, entries } = createMemoryLogger();
+  return { repo, now: clock.now, clock, logger, logs: entries };
 }

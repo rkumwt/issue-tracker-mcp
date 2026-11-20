@@ -69,7 +69,11 @@ describe('SqliteIssueRepository specifics', () => {
   });
 
   it('is created by the factory when STORAGE=sqlite', async () => {
-    const repo = await createRepository({ storage: 'sqlite', sqlitePath: ':memory:' });
+    const repo = await createRepository({
+      storage: 'sqlite',
+      sqlitePath: ':memory:',
+      logLevel: 'info',
+    });
     expect(repo).toBeInstanceOf(SqliteIssueRepository);
     await repo.close();
   });
