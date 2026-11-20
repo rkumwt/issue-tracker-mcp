@@ -12,8 +12,8 @@ MCP Inspector) and **remotely over Streamable HTTP** on AWS Lambda, backed by SQ
 | ----- | ------------------------------------------------------------ | ------- |
 | 1     | Project setup, data model, SQLite repository                 | ✅ Done |
 | 2     | MCP tools, resources, prompts + stdio transport              | ✅ Done |
-| 3     | Vitest tests + MCP Inspector instructions                    | ⏳ Next |
-| 4     | Streamable HTTP transport, API-key auth, logging, rate limit | ⏳      |
+| 3     | Vitest tests + MCP Inspector instructions                    | ✅ Done |
+| 4     | Streamable HTTP transport, API-key auth, logging, rate limit | ⏳ Next |
 | 5     | DynamoDB repository, Lambda handler, IaC, CI/CD              | ⏳      |
 
 ## Architecture (target)
@@ -90,9 +90,17 @@ src/
     errors.ts                # AppError + NotFound/Validation/Conflict/Config
     ids.ts                   # short prefixed IDs (iss_…, cmt_…)
   # coming next: http.ts (phase 4), lambda.ts (phase 5)
-tests/                       # phase 3
+tests/
+  helpers.ts                 # controllable clock + in-memory repository
+  db/repositoryContract.ts   # behaviour every IssueRepository must have (reused for DynamoDB)
+  db/sqliteRepository.test.ts
+  tools/                     # handler, runTool and input-schema tests
+  prompts/ resources/ models/
+  server.test.ts             # full MCP protocol via in-memory client ↔ server
+scripts/seed.ts              # demo data for Inspector / Claude Desktop
+examples/claude_desktop_config.json
 infra/                       # phase 5
-.github/workflows/ci.yml     # lint, typecheck, test, build on every push / PR
+.github/workflows/ci.yml     # format, lint, typecheck, test + coverage, build on every push / PR
 ```
 
 ## How MCP works in this project
@@ -248,14 +256,17 @@ The SQLite database is created automatically on first use (default `<project>/da
 git-ignored), and schema migrations run on startup. Environment variables are passed by the MCP
 client (for example the `env` block in Claude Desktop's config) or your shell. `.env.example` lists them.
 
-| Script                | What it does                               |
-| --------------------- | ------------------------------------------ |
-| `npm run dev:stdio`   | run the stdio server from TypeScript (tsx) |
-| `npm run start:stdio` | run the compiled server (`dist/stdio.js`)  |
-| `npm run build`       | compile `src/` to `dist/`                  |
-| `npm run lint`        | ESLint (type-aware)                        |
-| `npm run typecheck`   | `tsc --noEmit` over src and tests          |
-| `npm test`            | Vitest                                     |
+| Script                  | What it does                                 |
+| ----------------------- | -------------------------------------------- |
+| `npm run dev:stdio`     | run the stdio server from TypeScript (tsx)   |
+| `npm run start:stdio`   | run the compiled server (`dist/stdio.js`)    |
+| `npm run build`         | compile `src/` to `dist/`                    |
+| `npm run lint`          | ESLint (type-aware)                          |
+| `npm run typecheck`     | `tsc --noEmit` over src and tests            |
+| `npm test`              | Vitest                                       |
+| `npm run test:coverage` | Vitest with coverage + thresholds            |
+| `npm run seed`          | add demo issues (only if the DB is empty)    |
+| `npm run inspector`     | build, then open MCP Inspector on the server |
 
 ## Environment variables
 
@@ -267,11 +278,121 @@ client (for example the `env` block in Claude Desktop's config) or your shell. `
 ## CI/CD
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and pull request:
-`npm ci` → format check → lint → typecheck → test → build. It has read-only permissions and cancels
-superseded runs. Deployment to AWS is a separate workflow that runs only on `main` (phase 5).
+`npm ci` → format check → lint → typecheck → tests with coverage → build. It has read-only
+permissions and cancels superseded runs. Deployment to AWS is a separate workflow that runs only on
+`main` (phase 5).
 
 Branching follows GitHub Flow: one short-lived branch per phase (`2-mcp-tools-stdio`, …), a pull request
 into `main`, CI must pass, then squash merge.
 
-_Sections still to come: testing with MCP Inspector, Claude Desktop config, AWS deployment and budget
-alert, interview talking points._
+## Testing
+
+### Automated tests (Vitest)
+
+```bash
+npm test               # ~120 tests, under a second
+npm run test:coverage  # same, plus coverage report (coverage/index.html); CI fails below the floor
+```
+
+The suite is layered so each kind of failure shows up in exactly one place:
+
+| Layer                 | File(s)                              | What it proves                                                                                                  |
+| --------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| Repository contract   | `tests/db/repositoryContract.ts`     | Behaviour any storage backend must have: filters, ordering, partial updates, cascades, search escaping, summary |
+| SQLite specifics      | `tests/db/sqliteRepository.test.ts`  | File persistence, migrations, foreign keys, `CHECK` constraints                                                 |
+| Models                | `tests/models/models.test.ts`        | Label normalisation, limit clamping, the full status-transition matrix, config validation                       |
+| Tool handlers         | `tests/tools/tools.test.ts`          | Each tool's happy path and failure modes (not found, illegal transition, delete without confirm)                |
+| Error mapping         | `tests/tools/runTool.test.ts`        | `AppError` → `isError` with code; unexpected errors never leak details                                          |
+| Input validation      | `tests/tools/schemas.test.ts`        | Size limits, trimming, enums: the guardrail between the LLM and the database                                    |
+| Prompts and resources | `tests/prompts/`, `tests/resources/` | Weekly window maths, report grouping, triage content, injection data blocks, workflow docs                      |
+| Protocol              | `tests/server.test.ts`               | A real MCP `Client` over `InMemoryTransport`: listing, JSON Schema descriptions, SDK validation                 |
+
+Design choices worth knowing:
+
+- **No mocks of our own code.** Tests use a real SQLite `:memory:` database. It's fast (the whole
+  suite runs in under a second) and catches real SQL bugs that mocks would hide.
+- **Deterministic time.** A controllable clock is injected into the repository and prompts, so
+  ordering and "this week" logic never depend on when the tests run.
+- **A contract suite.** `describeRepositoryContract()` takes a factory, so the DynamoDB repository in
+  phase 5 must pass the same tests. That's the proof the backends are interchangeable.
+
+### Manual testing with MCP Inspector
+
+[MCP Inspector](https://github.com/modelcontextprotocol/inspector) is the official debugging UI for MCP
+servers: it lists tools, resources and prompts, and lets you call them with a form.
+
+```bash
+npm run seed       # optional: 7 realistic demo issues
+npm run inspector  # builds, then opens http://localhost:6274 in your browser
+```
+
+In the Inspector UI the transport is already set to **STDIO** with `node dist/stdio.js`. Click
+**Connect**, then try:
+
+1. **Tools → list_issues** with `status = open`: shortened descriptions, newest first.
+2. **Tools → change_status** on a closed issue with `status = resolved`: an `isError` result
+   explaining that only `open` is allowed.
+3. **Tools → delete_issue** with `confirm` unchecked: refused.
+4. **Resources → issues://summary** and **issues://workflow**.
+5. **Prompts → triage_issues** with `team = alice, bob`: the fully rendered prompt text.
+6. The **History** pane shows every JSON-RPC request and response, which is useful for seeing exactly what
+   an LLM client would receive.
+
+Inspector also has a scriptable CLI mode, handy for quick checks:
+
+```bash
+npx @modelcontextprotocol/inspector --cli node dist/stdio.js --method tools/list
+npx @modelcontextprotocol/inspector --cli node dist/stdio.js \
+  --method tools/call --tool-name search_issues --tool-arg keyword=payment
+npx @modelcontextprotocol/inspector --cli node dist/stdio.js \
+  --method resources/read --uri issues://summary
+```
+
+> Recent Inspector releases ask for Node ≥ 22.23. Older 22.x versions still work but print an
+> `EBADENGINE` warning; `nvm install 22` gets the latest 22.x.
+
+### Using it from Claude Desktop
+
+1. `npm run build` (Claude Desktop runs the compiled `dist/stdio.js`).
+2. Open **Settings → Developer → Edit Config** (this edits `claude_desktop_config.json`) and add the
+   block from [`examples/claude_desktop_config.json`](examples/claude_desktop_config.json):
+
+   ```json
+   {
+     "mcpServers": {
+       "issue-tracker": {
+         "command": "/ABSOLUTE/PATH/TO/node",
+         "args": ["/ABSOLUTE/PATH/TO/issue-tracker-mcp/dist/stdio.js"],
+         "env": {
+           "STORAGE": "sqlite",
+           "SQLITE_PATH": "/ABSOLUTE/PATH/TO/issue-tracker-mcp/data/issues.db"
+         }
+       }
+     }
+   }
+   ```
+
+3. Fully quit and restart Claude Desktop. The `issue-tracker` server and its tools show up in the
+   chat's tools/connectors menu; its prompts and resources can be added to a chat from the same
+   area.
+4. Try: _"What critical issues are open?"_, _"Start working on the checkout timeout and note that
+   the SDK timeout is the cause"_, or run the **weekly_report** prompt.
+
+Gotchas this config avoids:
+
+- **Use absolute paths everywhere.** Claude Desktop does not start in the project folder and does
+  not load your shell profile, so `node` from nvm is often not on its `PATH`. Find yours with
+  `which node`.
+- **Use the same Node major version you ran `npm install` with.** better-sqlite3 is a native addon
+  compiled for one Node ABI; running it with a different major version fails with
+  `NODE_MODULE_VERSION` errors.
+- Logs are in `~/Library/Logs/Claude/mcp-server-issue-tracker.log` (macOS).
+
+### Using it from Claude Code
+
+```bash
+claude mcp add issue-tracker -- node /ABSOLUTE/PATH/TO/issue-tracker-mcp/dist/stdio.js
+```
+
+_Sections still to come: Streamable HTTP and auth (phase 4), AWS deployment and budget alert, interview
+talking points (phase 5)._

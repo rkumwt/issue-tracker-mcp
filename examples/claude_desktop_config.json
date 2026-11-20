@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "issue-tracker": {
+      "command": "/ABSOLUTE/PATH/TO/node",
+      "args": ["/ABSOLUTE/PATH/TO/issue-tracker-mcp/dist/stdio.js"],
+      "env": {
+        "STORAGE": "sqlite",
+        "SQLITE_PATH": "/ABSOLUTE/PATH/TO/issue-tracker-mcp/data/issues.db"
+      }
+    }
+  }
+}
