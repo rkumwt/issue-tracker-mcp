@@ -7,12 +7,22 @@
  *
  * Later phases extend this with the HTTP port, API key and DynamoDB table name.
  */
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { ConfigError } from './lib/errors.js';
 
+/**
+ * Default DB location: <project root>/data/issues.db, as an ABSOLUTE path.
+ * Clients like Claude Desktop start the server with an unpredictable working
+ * directory (often "/"), so a relative default would put the database in a
+ * random place or fail. `..` from this file is the project root both when run
+ * from src/ (tsx) and from dist/ (compiled).
+ */
+const DEFAULT_SQLITE_PATH = fileURLToPath(new URL('../data/issues.db', import.meta.url));
+
 const ConfigSchema = z.object({
   STORAGE: z.enum(['sqlite', 'dynamodb']).default('sqlite'),
-  SQLITE_PATH: z.string().min(1).default('./data/issues.db'),
+  SQLITE_PATH: z.string().min(1).default(DEFAULT_SQLITE_PATH),
 });
 
 export interface AppConfig {
