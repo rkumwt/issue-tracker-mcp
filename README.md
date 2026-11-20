@@ -13,8 +13,8 @@ MCP Inspector) and **remotely over Streamable HTTP** on AWS Lambda, backed by SQ
 | 1     | Project setup, data model, SQLite repository                 | ✅ Done |
 | 2     | MCP tools, resources, prompts + stdio transport              | ✅ Done |
 | 3     | Vitest tests + MCP Inspector instructions                    | ✅ Done |
-| 4     | Streamable HTTP transport, API-key auth, logging, rate limit | ⏳ Next |
-| 5     | DynamoDB repository, Lambda handler, IaC, CI/CD              | ⏳      |
+| 4     | Streamable HTTP transport, API-key auth, logging, rate limit | ✅ Done |
+| 5     | DynamoDB repository, Lambda handler, IaC, CI/CD              | ⏳ Next |
 
 ## Architecture (target)
 
@@ -67,7 +67,9 @@ transport is used. Only the wiring differs.
 src/
   server.ts                  # createServer(): registers tools, resources, prompts (transport-agnostic)
   stdio.ts                   # stdio entry point (Claude Desktop, MCP Inspector)
-  context.ts                 # AppContext { repo, now } injected everywhere
+  http.ts                    # Streamable HTTP entry point (listen + graceful shutdown)
+  httpApp.ts                 # Express app: host check, logging, rate limit, auth, /mcp (stateless)
+  context.ts                 # AppContext { repo, now, logger } injected everywhere
   config.ts                  # env vars → typed, validated config (fail fast)
   models/
     issue.ts                 # Zod schemas + derived types, limits, label helpers
@@ -89,7 +91,10 @@ src/
   lib/
     errors.ts                # AppError + NotFound/Validation/Conflict/Config
     ids.ts                   # short prefixed IDs (iss_…, cmt_…)
-  # coming next: http.ts (phase 4), lambda.ts (phase 5)
+    logger.ts                # JSON-lines logger to stderr, secret redaction
+    loggingTransport.ts      # Transport decorator: logs every MCP request / tool call
+    auth.ts                  # Bearer API-key middleware (constant-time compare)
+  # coming next: lambda.ts (phase 5)
 tests/
   helpers.ts                 # controllable clock + in-memory repository
   db/repositoryContract.ts   # behaviour every IssueRepository must have (reused for DynamoDB)
@@ -238,6 +243,20 @@ instructions, a basic defence against prompt injection through issue text.
     status change goes through the workflow check in `change_status`.
 15. **Absolute default DB path.** Claude Desktop launches servers from an unpredictable working
     directory, so the default `SQLITE_PATH` resolves to `<project>/data/issues.db`, not `./data`.
+16. **Stateless Streamable HTTP.** Each `POST /mcp` gets a fresh server and transport with no session
+    id, so any instance can answer any request. That is what lets it run on Lambda (phase 5). The
+    trade-off is no server-initiated messages, which this server doesn't use.
+17. **JSON responses, not SSE.** `enableJsonResponse` returns one JSON body per request. API Gateway +
+    Lambda buffers responses anyway, and plain JSON is easier to debug with `curl`.
+18. **Log at the transport, not in each tool.** `LoggingTransport` decorates any `Transport` and sees
+    every request, including calls the SDK rejects before a handler runs. Logging inside handlers
+    would silently miss those. The same class serves stdio, HTTP and Lambda.
+19. **Log metadata, never content.** Tool name, duration, outcome and error code are logged; tool
+    arguments, results and the `Authorization` header are not. Secret-looking keys are redacted as a
+    second line of defence.
+20. **Middleware order is a security decision.** The rate limit runs before auth, so key guessing is
+    throttled; auth runs before body parsing, so unauthenticated callers can't make the server parse
+    large payloads.
 
 **Known limitation:** there is no status history, so `weekly_report` counts an issue as "resolved this
 week" if it is currently resolved/closed and was last updated this week. A `resolvedAt` field or an
@@ -256,24 +275,34 @@ The SQLite database is created automatically on first use (default `<project>/da
 git-ignored), and schema migrations run on startup. Environment variables are passed by the MCP
 client (for example the `env` block in Claude Desktop's config) or your shell. `.env.example` lists them.
 
-| Script                  | What it does                                 |
-| ----------------------- | -------------------------------------------- |
-| `npm run dev:stdio`     | run the stdio server from TypeScript (tsx)   |
-| `npm run start:stdio`   | run the compiled server (`dist/stdio.js`)    |
-| `npm run build`         | compile `src/` to `dist/`                    |
-| `npm run lint`          | ESLint (type-aware)                          |
-| `npm run typecheck`     | `tsc --noEmit` over src and tests            |
-| `npm test`              | Vitest                                       |
-| `npm run test:coverage` | Vitest with coverage + thresholds            |
-| `npm run seed`          | add demo issues (only if the DB is empty)    |
-| `npm run inspector`     | build, then open MCP Inspector on the server |
+| Script                  | What it does                                  |
+| ----------------------- | --------------------------------------------- |
+| `npm run dev:stdio`     | run the stdio server from TypeScript (tsx)    |
+| `npm run start:stdio`   | run the compiled server (`dist/stdio.js`)     |
+| `npm run dev:http`      | run the HTTP server from TypeScript (tsx)     |
+| `npm run start:http`    | run the compiled HTTP server (`dist/http.js`) |
+| `npm run build`         | compile `src/` to `dist/`                     |
+| `npm run lint`          | ESLint (type-aware)                           |
+| `npm run typecheck`     | `tsc --noEmit` over src and tests             |
+| `npm test`              | Vitest                                        |
+| `npm run test:coverage` | Vitest with coverage + thresholds             |
+| `npm run seed`          | add demo issues (only if the DB is empty)     |
+| `npm run inspector`     | build, then open MCP Inspector on the server  |
 
 ## Environment variables
 
-| Variable      | Default                    | Description                                |
-| ------------- | -------------------------- | ------------------------------------------ |
-| `STORAGE`     | `sqlite`                   | `sqlite` or `dynamodb` (phase 5)           |
-| `SQLITE_PATH` | `<project>/data/issues.db` | SQLite file path; `:memory:` for throwaway |
+| Variable                | Default                    | Used by | Description                                                    |
+| ----------------------- | -------------------------- | ------- | -------------------------------------------------------------- |
+| `STORAGE`               | `sqlite`                   | all     | `sqlite` or `dynamodb` (phase 5)                               |
+| `SQLITE_PATH`           | `<project>/data/issues.db` | all     | SQLite file path; `:memory:` for throwaway                     |
+| `LOG_LEVEL`             | `info`                     | all     | `debug` also logs non-tool requests (list, ping) and `/health` |
+| `MCP_API_KEY`           | _(required)_               | HTTP    | Bearer token clients must send; at least 32 characters         |
+| `PORT`                  | `3000`                     | HTTP    | Listen port                                                    |
+| `HOST`                  | `127.0.0.1`                | HTTP    | Listen address; loopback enables the localhost Host check      |
+| `RATE_LIMIT_PER_MINUTE` | `60`                       | HTTP    | Requests per client IP per minute (including failed auth)      |
+| `MAX_BODY_BYTES`        | `102400`                   | HTTP    | Max JSON body size (1 KB to 1 MB)                              |
+| `ALLOWED_HOSTS`         | _(unset)_                  | HTTP    | Comma-separated Host header allow-list (DNS-rebinding defence) |
+| `TRUST_PROXY`           | `0`                        | HTTP    | Proxy hops to trust for the client IP (set behind a proxy)     |
 
 ## CI/CD
 
@@ -290,22 +319,25 @@ into `main`, CI must pass, then squash merge.
 ### Automated tests (Vitest)
 
 ```bash
-npm test               # ~120 tests, under a second
+npm test               # ~170 tests, about a second
 npm run test:coverage  # same, plus coverage report (coverage/index.html); CI fails below the floor
 ```
 
 The suite is layered so each kind of failure shows up in exactly one place:
 
-| Layer                 | File(s)                              | What it proves                                                                                                  |
-| --------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| Repository contract   | `tests/db/repositoryContract.ts`     | Behaviour any storage backend must have: filters, ordering, partial updates, cascades, search escaping, summary |
-| SQLite specifics      | `tests/db/sqliteRepository.test.ts`  | File persistence, migrations, foreign keys, `CHECK` constraints                                                 |
-| Models                | `tests/models/models.test.ts`        | Label normalisation, limit clamping, the full status-transition matrix, config validation                       |
-| Tool handlers         | `tests/tools/tools.test.ts`          | Each tool's happy path and failure modes (not found, illegal transition, delete without confirm)                |
-| Error mapping         | `tests/tools/runTool.test.ts`        | `AppError` → `isError` with code; unexpected errors never leak details                                          |
-| Input validation      | `tests/tools/schemas.test.ts`        | Size limits, trimming, enums: the guardrail between the LLM and the database                                    |
-| Prompts and resources | `tests/prompts/`, `tests/resources/` | Weekly window maths, report grouping, triage content, injection data blocks, workflow docs                      |
-| Protocol              | `tests/server.test.ts`               | A real MCP `Client` over `InMemoryTransport`: listing, JSON Schema descriptions, SDK validation                 |
+| Layer                 | File(s)                                     | What it proves                                                                                                  |
+| --------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Repository contract   | `tests/db/repositoryContract.ts`            | Behaviour any storage backend must have: filters, ordering, partial updates, cascades, search escaping, summary |
+| SQLite specifics      | `tests/db/sqliteRepository.test.ts`         | File persistence, migrations, foreign keys, `CHECK` constraints                                                 |
+| Models                | `tests/models/models.test.ts`               | Label normalisation, limit clamping, the full status-transition matrix, config validation                       |
+| Tool handlers         | `tests/tools/tools.test.ts`                 | Each tool's happy path and failure modes (not found, illegal transition, delete without confirm)                |
+| Error mapping         | `tests/tools/runTool.test.ts`               | `AppError` → `isError` with code; unexpected errors never leak details                                          |
+| Input validation      | `tests/tools/schemas.test.ts`               | Size limits, trimming, enums: the guardrail between the LLM and the database                                    |
+| Prompts and resources | `tests/prompts/`, `tests/resources/`        | Weekly window maths, report grouping, triage content, injection data blocks, workflow docs                      |
+| Protocol              | `tests/server.test.ts`                      | A real MCP `Client` over `InMemoryTransport`: listing, JSON Schema descriptions, SDK validation                 |
+| HTTP transport        | `tests/http/httpApp.test.ts`                | Auth, 413/400/404/405/429, Host check, stateless MCP over HTTP, request-id correlated logs (supertest)          |
+| HTTP config and auth  | `tests/http/config.test.ts`, `auth.test.ts` | Required/minimum-length API key (never echoed), bearer parsing, constant-time compare                           |
+| Logging               | `tests/lib/`                                | JSON shape, levels, redaction; every tool call logged with outcome/code, arguments never logged                 |
 
 Design choices worth knowing:
 
@@ -394,5 +426,102 @@ Gotchas this config avoids:
 claude mcp add issue-tracker -- node /ABSOLUTE/PATH/TO/issue-tracker-mcp/dist/stdio.js
 ```
 
-_Sections still to come: Streamable HTTP and auth (phase 4), AWS deployment and budget alert, interview
-talking points (phase 5)._
+## Remote access: Streamable HTTP
+
+Run the same server over HTTP, so it can be reached from other machines or (phase 5) from AWS Lambda:
+
+```bash
+export MCP_API_KEY=$(openssl rand -hex 32)   # 64 hex chars; keep it secret
+npm run dev:http                             # http://127.0.0.1:3000/mcp
+```
+
+A request goes through this pipeline:
+
+```mermaid
+flowchart LR
+  C[MCP client] -->|POST /mcp<br/>Authorization: Bearer| H[Host check<br/>DNS rebinding]
+  H --> L[Request id +<br/>access log]
+  L --> RL[Rate limit<br/>429]
+  RL --> A[API key<br/>401]
+  A --> B[JSON body<br/>size limit 413]
+  B --> T[New McpServer +<br/>StreamableHTTP transport<br/>stateless, JSON response]
+  T --> LT[LoggingTransport<br/>tool_call logs]
+  LT --> R[(IssueRepository)]
+```
+
+Try it with `curl`:
+
+```bash
+# Health check (no auth)
+curl -s http://127.0.0.1:3000/health
+
+# List tools
+curl -s http://127.0.0.1:3000/mcp \
+  -H "Authorization: Bearer $MCP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+# Call a tool
+curl -s http://127.0.0.1:3000/mcp \
+  -H "Authorization: Bearer $MCP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_issues","arguments":{"status":"open"}}}'
+```
+
+Connect a client:
+
+- **MCP Inspector:** run `npx @modelcontextprotocol/inspector`, choose transport **Streamable HTTP**,
+  URL `http://127.0.0.1:3000/mcp`, and add an `Authorization: Bearer <key>` header in the
+  authentication settings.
+- **Claude Code:**
+
+  ```bash
+  claude mcp add --transport http issue-tracker http://127.0.0.1:3000/mcp \
+    --header "Authorization: Bearer $MCP_API_KEY"
+  ```
+
+## Security and guardrails
+
+| Threat                                      | Mitigation                                                                                          |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Unauthenticated access                      | `Authorization: Bearer` API key, compared in constant time; 401 + `WWW-Authenticate`                |
+| Weak or leaked keys                         | Minimum 32 characters, never logged or echoed in errors; on AWS it lives in SSM Parameter Store     |
+| Brute force / abuse                         | Per-IP rate limit (also counts failed auth); on AWS, API Gateway throttling is added on top         |
+| Huge payloads                               | `MAX_BODY_BYTES` body limit (413), per-field Zod limits, list results capped at 200                 |
+| DNS rebinding against a local server        | Host header validation (localhost by default, `ALLOWED_HOSTS` otherwise)                            |
+| SQL injection                               | Bound parameters only; `LIKE` wildcards escaped                                                     |
+| Accidental destructive actions by the model | `delete_issue` requires `confirm: true`; annotated `destructiveHint`                                |
+| Prompt injection via issue text             | Prompts wrap issue data in `<issues>` blocks marked as data                                         |
+| Information leaks                           | Unexpected errors return a generic message; `x-powered-by` disabled; logs exclude arguments/results |
+
+A single shared API key suits a personal or team server. A multi-user product would implement the
+MCP authorization spec (OAuth 2.1 with per-user tokens and scopes), so each tool call could be
+attributed to, and authorized for, a specific user.
+
+## Logging
+
+Every log line is one JSON object on **stderr** (stdout belongs to the stdio protocol; on Lambda,
+stderr goes to CloudWatch). Every tool call produces exactly one `tool_call` entry:
+
+```json
+{"time":"2026-11-20T08:12:40.983Z","level":"info","msg":"tool call","service":"issue-tracker-mcp","requestId":"40c62ce6-…","event":"tool_call","method":"tools/call","tool":"create_issue","durationMs":1.34,"outcome":"success"}
+{"time":"2026-11-20T08:12:40.988Z","level":"warn","msg":"tool call failed","service":"issue-tracker-mcp","requestId":"b1fac43f-…","event":"tool_call","method":"tools/call","tool":"change_status","durationMs":0.42,"outcome":"tool_error","errorCode":"INVALID_INPUT"}
+```
+
+| `outcome`    | Meaning                                                                        | `errorCode` examples                                 |
+| ------------ | ------------------------------------------------------------------------------ | ---------------------------------------------------- |
+| `success`    | Tool returned a normal result                                                  | none                                                 |
+| `tool_error` | Tool returned `isError: true` (domain error, or arguments rejected by the SDK) | `NOT_FOUND`, `CONFLICT`, `INVALID_INPUT`, `INTERNAL` |
+| `rpc_error`  | JSON-RPC level failure (unknown resource, bad method)                          | `RPC_-32602`                                         |
+
+HTTP requests also get an `http_request` access-log line, plus `auth_failed` and `rate_limited`
+events. They all share the request's `requestId`, which is taken from the client's `x-request-id`
+header if it's safe, generated otherwise, and returned in the response header.
+
+**Never logged:** tool arguments, tool results, the `Authorization` header or API key. Keys named like
+`authorization`, `apiKey`, `token`, `secret`, `password` or `cookie` are redacted at any depth as a
+safety net.
+
+_Sections still to come: AWS deployment and budget alert, interview talking points (phase 5)._

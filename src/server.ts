@@ -10,12 +10,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AppContext } from './context.js';
 import type { IssueRepository } from './db/IssueRepository.js';
+import { silentLogger, type Logger } from './lib/logger.js';
 import { registerPrompts } from './prompts/index.js';
 import { registerResources } from './resources/index.js';
 import { registerTools } from './tools/index.js';
 
 export const SERVER_NAME = 'issue-tracker-mcp';
-export const SERVER_VERSION = '0.3.0';
+export const SERVER_VERSION = '0.4.0';
 
 /**
  * Sent to the client during initialisation. Many clients add it to the system
@@ -33,10 +34,16 @@ export interface CreateServerOptions {
   repo: IssueRepository;
   /** Override the clock (tests). Defaults to the real time. */
   now?: () => Date;
+  /** Structured logger. Defaults to a silent logger (library-friendly). */
+  logger?: Logger;
 }
 
-export function createServer({ repo, now = () => new Date() }: CreateServerOptions): McpServer {
-  const ctx: AppContext = { repo, now };
+export function createServer({
+  repo,
+  now = () => new Date(),
+  logger = silentLogger,
+}: CreateServerOptions): McpServer {
+  const ctx: AppContext = { repo, now, logger };
 
   const server = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
