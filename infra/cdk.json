@@ -8,6 +8,8 @@
     "apiKeyParameterName": "/issue-tracker-mcp/api-key",
     "githubRepository": "rkumwt/issue-tracker-mcp",
     "githubEnvironment": "production",
+    "githubOwnerId": "21355037",
+    "githubRepositoryId": "1465100792",
     "monthlyBudgetUsd": 10,
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:checkSecretUsage": true,

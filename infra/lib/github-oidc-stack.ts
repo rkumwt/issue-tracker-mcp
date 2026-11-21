@@ -21,11 +21,42 @@ import type { Construct } from 'constructs';
 
 const GITHUB_ISSUER = 'token.actions.githubusercontent.com';
 
+/**
+ * The token's `sub` claim for a job running in a GitHub Environment.
+ *
+ * GitHub now includes IMMUTABLE numeric IDs in the subject:
+ *   repo:<owner>@<ownerId>/<repo>@<repoId>:environment:<env>
+ * instead of the older name-only form
+ *   repo:<owner>/<repo>:environment:<env>
+ * IDs never get reused, so a trust policy pinned to them can't be matched by
+ * someone who later re-creates a deleted or renamed repository under the same
+ * name. Find the real value in CloudTrail (AssumeRoleWithWebIdentity →
+ * userIdentity.userName) or from the GitHub API (owner.id and id of the repo).
+ */
+export function githubSubject(props: {
+  repository: string;
+  environment: string;
+  ownerId?: string | undefined;
+  repositoryId?: string | undefined;
+}): string {
+  const [owner, name] = props.repository.split('/');
+  if (!owner || !name)
+    throw new Error(`repository must be "owner/name", got "${props.repository}"`);
+  const repo =
+    props.ownerId && props.repositoryId
+      ? `${owner}@${props.ownerId}/${name}@${props.repositoryId}`
+      : `${owner}/${name}`;
+  return `repo:${repo}:environment:${props.environment}`;
+}
+
 export interface GitHubOidcStackProps extends StackProps {
   /** "owner/repo" allowed to deploy. */
   repository: string;
   /** GitHub Environment the deploy job runs in (part of the token's `sub` claim). */
   environment: string;
+  /** Numeric GitHub IDs of the owner and repository (ID-based `sub` claims). */
+  ownerId?: string | undefined;
+  repositoryId?: string | undefined;
   /** Reuse an existing GitHub OIDC provider instead of creating one. */
   existingProviderArn?: string | undefined;
 }
@@ -52,10 +83,10 @@ export class GitHubOidcStack extends Stack {
       assumedBy: new iam.WebIdentityPrincipal(provider.oidcProviderArn, {
         StringEquals: {
           [`${GITHUB_ISSUER}:aud`]: 'sts.amazonaws.com',
-          // Jobs that use a GitHub Environment get this exact `sub` format.
-          // Pinning it means only the protected "production" environment of
-          // this one repository can deploy: not forks, not other branches' PRs.
-          [`${GITHUB_ISSUER}:sub`]: `repo:${props.repository}:environment:${props.environment}`,
+          // Pinning the exact `sub` means only the protected "production"
+          // environment of this one repository can deploy: not forks, not
+          // other branches' PRs (see githubSubject() for the format).
+          [`${GITHUB_ISSUER}:sub`]: githubSubject(props),
         },
       }),
     });

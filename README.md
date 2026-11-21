@@ -286,7 +286,9 @@ instructions, a basic defence against prompt injection through issue text.
     DynamoDB on-demand, two-week log retention, and stage throttling as a spending cap.
 26. **No long-lived AWS keys in CI.** GitHub Actions assumes a role through OIDC. The trust policy
     pins the exact repository _and_ the `production` environment, and the role may only assume the
-    CDK bootstrap roles.
+    CDK bootstrap roles. The subject uses GitHub's **immutable numeric IDs**
+    (`repo:owner@<ownerId>/repo@<repoId>:environment:production`, set via `githubOwnerId` /
+    `githubRepositoryId` in `cdk.json`), so a re-created repository with the same name can't match.
 27. **Data outlives the stack.** The table has `RemovalPolicy.RETAIN` and point-in-time recovery, so
     `cdk destroy` or a bad refactor can't silently delete production data.
 
@@ -816,6 +818,10 @@ burst 20), no always-on compute, two-week log retention, and the budget alert.
   skipped it forever. A job-level `if` is evaluated before the job enters its environment, so
   environment-scoped variables are always empty there. Caught on the first merge by checking the job
   had actually run, not just that the workflow was green.
+- A third, also caught only on the real deploy: OIDC `AccessDenied`. I diagnosed it from evidence
+  rather than guesswork: CloudTrail's rejected `AssumeRoleWithWebIdentity` events show the token's
+  actual `sub` claim, which GitHub now builds with immutable owner/repo IDs. The trust policy now pins
+  that exact ID-based subject, and a test asserts it.
 - GitHub Flow with one PR per phase; `main` deploys automatically after CI, through a protected
   environment.
 
