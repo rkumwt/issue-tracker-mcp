@@ -15,7 +15,6 @@
  */
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import Database from 'better-sqlite3';
 import type { Database as DatabaseType, Statement } from 'better-sqlite3';
 import { NotFoundError } from '../../lib/errors.js';
 import { newCommentId, newIssueId } from '../../lib/ids.js';
@@ -34,6 +33,7 @@ import {
   type UpdateIssueInput,
 } from '../../models/issue.js';
 import type { IssueRepository } from '../IssueRepository.js';
+import { loadSqliteDriver } from './driver.js';
 import { migrate } from './schema.js';
 
 /** Row shapes exactly as SQLite returns them (snake_case, labels as JSON text). */
@@ -158,6 +158,8 @@ export class SqliteIssueRepository implements IssueRepository {
    */
   static open(path: string, options?: SqliteRepositoryOptions): SqliteIssueRepository {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
+    // Loaded lazily so the Lambda bundle never touches the native addon (see driver.ts).
+    const Database = loadSqliteDriver();
     const db = new Database(path);
     db.pragma('journal_mode = WAL'); // readers don't block the writer
     db.pragma('foreign_keys = ON'); // SQLite has FK enforcement OFF by default!
