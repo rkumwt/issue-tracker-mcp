@@ -1,0 +1,17 @@
+{
+  "app": "npx tsx bin/app.ts",
+  "watch": {
+    "include": ["bin/**", "lib/**", "../src/**"],
+    "exclude": ["cdk.out", "node_modules"]
+  },
+  "context": {
+    "apiKeyParameterName": "/issue-tracker-mcp/api-key",
+    "githubRepository": "rkumwt/issue-tracker-mcp",
+    "githubEnvironment": "production",
+    "monthlyBudgetUsd": 10,
+    "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/core:target-partitions": ["aws"]
+  }
+}

@@ -92,6 +92,34 @@ function requestLogging(logger: Logger): RequestHandler {
   };
 }
 
+/**
+ * On Lambda, serverless-express hands Express a request whose body has already
+ * been read into a Buffer, so express.json() skips it. This parses that Buffer
+ * and, importantly, applies the same size limit; otherwise MAX_BODY_BYTES would
+ * silently not apply on Lambda. Errors reuse body-parser's error types, so the
+ * central error handler answers with the same 413 / 400 responses.
+ */
+function parseBufferedJson(maxBytes: number): RequestHandler {
+  return (req, _res, next) => {
+    const raw: unknown = req.body;
+    if (!Buffer.isBuffer(raw) && typeof raw !== 'string') {
+      next();
+      return;
+    }
+    if (Buffer.byteLength(raw) > maxBytes) {
+      next(Object.assign(new Error('request entity too large'), { type: 'entity.too.large' }));
+      return;
+    }
+    try {
+      const text = raw.toString();
+      req.body = text.length === 0 ? undefined : (JSON.parse(text) as unknown);
+      next();
+    } catch {
+      next(Object.assign(new Error('invalid JSON'), { type: 'entity.parse.failed' }));
+    }
+  };
+}
+
 function requestLogger(res: Response, fallback: Logger): Logger {
   return (res.locals.logger as Logger | undefined) ?? fallback;
 }
@@ -130,8 +158,9 @@ export function createHttpApp(options: HttpAppOptions): Express {
 
   const auth = bearerAuth(options.apiKey, logger);
   const jsonBody = express.json({ limit: options.maxBodyBytes });
+  const bufferedBody = parseBufferedJson(options.maxBodyBytes);
 
-  app.post('/mcp', limiter, auth, jsonBody, async (req: Request, res: Response) => {
+  app.post('/mcp', limiter, auth, jsonBody, bufferedBody, async (req: Request, res: Response) => {
     const reqLogger = requestLogger(res, logger);
     const server = createServer({ repo, logger: reqLogger, ...(now && { now }) });
     const transport = new StreamableHTTPServerTransport({

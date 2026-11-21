@@ -14,9 +14,9 @@ MCP Inspector) and **remotely over Streamable HTTP** on AWS Lambda, backed by SQ
 | 2     | MCP tools, resources, prompts + stdio transport              | ✅ Done |
 | 3     | Vitest tests + MCP Inspector instructions                    | ✅ Done |
 | 4     | Streamable HTTP transport, API-key auth, logging, rate limit | ✅ Done |
-| 5     | DynamoDB repository, Lambda handler, IaC, CI/CD              | ⏳ Next |
+| 5     | DynamoDB repository, Lambda handler, IaC, CI/CD              | ✅ Done |
 
-## Architecture (target)
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -56,7 +56,9 @@ transport is used. Only the wiring differs.
 - **@modelcontextprotocol/sdk** (`McpServer`, `registerTool` / `registerResource` / `registerPrompt`)
 - **Zod 4** for validation, the single source of truth for types
 - **better-sqlite3** (local) / **AWS SDK v3 DynamoDB** (production)
-- **Vitest**, ESLint (typescript-eslint, type-aware), Prettier
+- **Express 5** + Streamable HTTP; **AWS Lambda** (Node 22, arm64) via `@codegenie/serverless-express`
+- **AWS CDK** (TypeScript) for infrastructure; **GitHub Actions** with OIDC for CI/CD
+- **Vitest**, ESLint (typescript-eslint, type-aware), Prettier, DynamoDB Local for tests
 
 > **Why Node 22 and not Node 20?** Node 20 reached end-of-life in April 2026, and current releases of
 > Vitest require Node ≥ 22. Node 22 is the active LTS line and a supported AWS Lambda runtime.
@@ -88,13 +90,16 @@ src/
     sqlite/
       schema.ts              # tables + PRAGMA user_version migrations
       SqliteIssueRepository.ts
+    dynamodb/
+      table.ts               # single-table key design + createIssueTable (local/tests)
+      DynamoIssueRepository.ts
   lib/
     errors.ts                # AppError + NotFound/Validation/Conflict/Config
     ids.ts                   # short prefixed IDs (iss_…, cmt_…)
     logger.ts                # JSON-lines logger to stderr, secret redaction
     loggingTransport.ts      # Transport decorator: logs every MCP request / tool call
     auth.ts                  # Bearer API-key middleware (constant-time compare)
-  # coming next: lambda.ts (phase 5)
+  lambda.ts                  # Lambda handler: API Gateway → same Express app; key from SSM
 tests/
   helpers.ts                 # controllable clock + in-memory repository
   db/repositoryContract.ts   # behaviour every IssueRepository must have (reused for DynamoDB)
@@ -102,10 +107,18 @@ tests/
   tools/                     # handler, runTool and input-schema tests
   prompts/ resources/ models/
   server.test.ts             # full MCP protocol via in-memory client ↔ server
-scripts/seed.ts              # demo data for Inspector / Claude Desktop
+scripts/
+  seed.ts                    # demo data for Inspector / Claude Desktop
+  create-dynamodb-table.ts   # table for DynamoDB Local
 examples/claude_desktop_config.json
-infra/                       # phase 5
-.github/workflows/ci.yml     # format, lint, typecheck, test + coverage, build on every push / PR
+infra/                       # AWS CDK app (own package.json)
+  bin/app.ts                 # stacks + context (cdk.json)
+  lib/issue-tracker-stack.ts # API Gateway HTTP API + Lambda + DynamoDB + log group + budget
+  lib/github-oidc-stack.ts   # one-time: OIDC provider + GitHub deploy role
+  test/stacks.test.ts        # CloudFormation template assertions
+.github/workflows/
+  ci.yml                     # PRs/branches: format, lint, typecheck, tests (+ DynamoDB Local), infra synth
+  deploy.yml                 # push to main: CI, then cdk deploy via OIDC + smoke test
 ```
 
 ## How MCP works in this project
@@ -244,7 +257,7 @@ instructions, a basic defence against prompt injection through issue text.
 15. **Absolute default DB path.** Claude Desktop launches servers from an unpredictable working
     directory, so the default `SQLITE_PATH` resolves to `<project>/data/issues.db`, not `./data`.
 16. **Stateless Streamable HTTP.** Each `POST /mcp` gets a fresh server and transport with no session
-    id, so any instance can answer any request. That is what lets it run on Lambda (phase 5). The
+    id, so any instance can answer any request. That is what lets it run on Lambda. The
     trade-off is no server-initiated messages, which this server doesn't use.
 17. **JSON responses, not SSE.** `enableJsonResponse` returns one JSON body per request. API Gateway +
     Lambda buffers responses anyway, and plain JSON is easier to debug with `curl`.
@@ -257,6 +270,25 @@ instructions, a basic defence against prompt injection through issue text.
 20. **Middleware order is a security decision.** The rate limit runs before auth, so key guessing is
     throttled; auth runs before body parsing, so unauthenticated callers can't make the server parse
     large payloads.
+21. **DynamoDB single-table design.** An issue and its comments share a partition, so "issue +
+    comments" is one query and a delete finds everything in one place. Two GSIs serve the access
+    patterns: newest-first listing (`gsi1`) and by-status listing (`gsi2`).
+22. **"Limit" means matches, not reads.** DynamoDB's `Limit` counts items _read_ before the
+    `FilterExpression`, so the repository keeps paging until it has collected enough _matches_. The
+    contract suite runs a second time with 1-item pages to prove it.
+23. **One Express app everywhere.** Lambda runs the same app as `npm run dev:http` through
+    serverless-express, so auth, limits and logging are tested once and behave identically in AWS.
+24. **API key in SSM Parameter Store, read at runtime.** Lambda gets only the parameter _name_; the
+    SecureString value never appears in the template, the repository or the function's
+    configuration. Standard parameters are free, whereas Secrets Manager costs about $0.40 per secret
+    per month and its rotation features aren't needed here.
+25. **Cheapest sensible AWS building blocks.** An HTTP API instead of a REST API, Lambda on arm64,
+    DynamoDB on-demand, two-week log retention, and stage throttling as a spending cap.
+26. **No long-lived AWS keys in CI.** GitHub Actions assumes a role through OIDC. The trust policy
+    pins the exact repository _and_ the `production` environment, and the role may only assume the
+    CDK bootstrap roles.
+27. **Data outlives the stack.** The table has `RemovalPolicy.RETAIN` and point-in-time recovery, so
+    `cdk destroy` or a bad refactor can't silently delete production data.
 
 **Known limitation:** there is no status history, so `weekly_report` counts an issue as "resolved this
 week" if it is currently resolved/closed and was last updated this week. A `resolvedAt` field or an
@@ -275,41 +307,63 @@ The SQLite database is created automatically on first use (default `<project>/da
 git-ignored), and schema migrations run on startup. Environment variables are passed by the MCP
 client (for example the `env` block in Claude Desktop's config) or your shell. `.env.example` lists them.
 
-| Script                  | What it does                                  |
-| ----------------------- | --------------------------------------------- |
-| `npm run dev:stdio`     | run the stdio server from TypeScript (tsx)    |
-| `npm run start:stdio`   | run the compiled server (`dist/stdio.js`)     |
-| `npm run dev:http`      | run the HTTP server from TypeScript (tsx)     |
-| `npm run start:http`    | run the compiled HTTP server (`dist/http.js`) |
-| `npm run build`         | compile `src/` to `dist/`                     |
-| `npm run lint`          | ESLint (type-aware)                           |
-| `npm run typecheck`     | `tsc --noEmit` over src and tests             |
-| `npm test`              | Vitest                                        |
-| `npm run test:coverage` | Vitest with coverage + thresholds             |
-| `npm run seed`          | add demo issues (only if the DB is empty)     |
-| `npm run inspector`     | build, then open MCP Inspector on the server  |
+| Script                          | What it does                                  |
+| ------------------------------- | --------------------------------------------- |
+| `npm run dev:stdio`             | run the stdio server from TypeScript (tsx)    |
+| `npm run start:stdio`           | run the compiled server (`dist/stdio.js`)     |
+| `npm run dev:http`              | run the HTTP server from TypeScript (tsx)     |
+| `npm run start:http`            | run the compiled HTTP server (`dist/http.js`) |
+| `npm run build`                 | compile `src/` to `dist/`                     |
+| `npm run lint`                  | ESLint (type-aware)                           |
+| `npm run typecheck`             | `tsc --noEmit` over src and tests             |
+| `npm test`                      | Vitest                                        |
+| `npm run test:coverage`         | Vitest with coverage + thresholds             |
+| `npm run seed`                  | add demo issues (only if the DB is empty)     |
+| `npm run inspector`             | build, then open MCP Inspector on the server  |
+| `npm run dynamodb:create-table` | create the table in DynamoDB Local            |
 
 ## Environment variables
 
-| Variable                | Default                    | Used by | Description                                                    |
-| ----------------------- | -------------------------- | ------- | -------------------------------------------------------------- |
-| `STORAGE`               | `sqlite`                   | all     | `sqlite` or `dynamodb` (phase 5)                               |
-| `SQLITE_PATH`           | `<project>/data/issues.db` | all     | SQLite file path; `:memory:` for throwaway                     |
-| `LOG_LEVEL`             | `info`                     | all     | `debug` also logs non-tool requests (list, ping) and `/health` |
-| `MCP_API_KEY`           | _(required)_               | HTTP    | Bearer token clients must send; at least 32 characters         |
-| `PORT`                  | `3000`                     | HTTP    | Listen port                                                    |
-| `HOST`                  | `127.0.0.1`                | HTTP    | Listen address; loopback enables the localhost Host check      |
-| `RATE_LIMIT_PER_MINUTE` | `60`                       | HTTP    | Requests per client IP per minute (including failed auth)      |
-| `MAX_BODY_BYTES`        | `102400`                   | HTTP    | Max JSON body size (1 KB to 1 MB)                              |
-| `ALLOWED_HOSTS`         | _(unset)_                  | HTTP    | Comma-separated Host header allow-list (DNS-rebinding defence) |
-| `TRUST_PROXY`           | `0`                        | HTTP    | Proxy hops to trust for the client IP (set behind a proxy)     |
+| Variable                | Default                    | Used by | Description                                                     |
+| ----------------------- | -------------------------- | ------- | --------------------------------------------------------------- |
+| `STORAGE`               | `sqlite`                   | all     | `sqlite` or `dynamodb`                                          |
+| `SQLITE_PATH`           | `<project>/data/issues.db` | all     | SQLite file path; `:memory:` for throwaway                      |
+| `LOG_LEVEL`             | `info`                     | all     | `debug` also logs non-tool requests (list, ping) and `/health`  |
+| `MCP_API_KEY`           | _(required)_               | HTTP    | Bearer token clients must send; at least 32 characters          |
+| `PORT`                  | `3000`                     | HTTP    | Listen port                                                     |
+| `HOST`                  | `127.0.0.1`                | HTTP    | Listen address; loopback enables the localhost Host check       |
+| `RATE_LIMIT_PER_MINUTE` | `60`                       | HTTP    | Requests per client IP per minute (including failed auth)       |
+| `MAX_BODY_BYTES`        | `102400`                   | HTTP    | Max JSON body size (1 KB to 1 MB)                               |
+| `ALLOWED_HOSTS`         | _(unset)_                  | HTTP    | Comma-separated Host header allow-list (DNS-rebinding defence)  |
+| `TRUST_PROXY`           | `0`                        | HTTP    | Proxy hops to trust for the client IP (set behind a proxy)      |
+| `DYNAMODB_TABLE`        | _(unset)_                  | all     | Table name; required when `STORAGE=dynamodb`                    |
+| `DYNAMODB_ENDPOINT`     | _(unset)_                  | all     | DynamoDB Local URL (e.g. `http://localhost:8000`); unset on AWS |
+| `AWS_REGION`            | _(from AWS)_               | all     | Region for DynamoDB/SSM (Lambda sets it automatically)          |
+| `MCP_API_KEY_PARAMETER` | _(unset)_                  | Lambda  | SSM SecureString parameter holding the API key (set by CDK)     |
 
 ## CI/CD
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and pull request:
-`npm ci` → format check → lint → typecheck → tests with coverage → build. It has read-only
-permissions and cancels superseded runs. Deployment to AWS is a separate workflow that runs only on
-`main` (phase 5).
+```mermaid
+flowchart LR
+  PR[Pull request /<br/>feature branch push] --> CI
+  MAIN[Push to main] --> DEP[deploy.yml]
+  DEP --> CI[ci.yml<br/>verify + infra]
+  CI -->|green| D[deploy job<br/>environment: production]
+  D -->|OIDC| AWS[assume deploy role]
+  AWS --> CDK[cdk deploy] --> SMOKE[GET /health]
+```
+
+- [`ci.yml`](.github/workflows/ci.yml) runs on pull requests and feature-branch pushes, and is reused
+  by the deploy workflow. It has two jobs:
+  - **verify:** format → lint → typecheck → tests with coverage (with DynamoDB Local as a service
+    container, so the DynamoDB contract tests run too) → build.
+  - **infra:** typecheck → CloudFormation template tests → `cdk synth`. Synth needs no AWS
+    credentials.
+- [`deploy.yml`](.github/workflows/deploy.yml) runs on every push to `main`. It runs CI first, then
+  the deploy job in the `production` GitHub Environment: it assumes the AWS role through OIDC, runs
+  `cdk deploy`, smoke-tests `/health`, and writes the endpoint to the run summary. Deployments never
+  run concurrently and are never cancelled half-way. The deploy job is skipped until
+  `AWS_DEPLOY_ROLE_ARN` is configured, so the repository works without AWS.
 
 Branching follows GitHub Flow: one short-lived branch per phase (`2-mcp-tools-stdio`, …), a pull request
 into `main`, CI must pass, then squash merge.
@@ -319,25 +373,32 @@ into `main`, CI must pass, then squash merge.
 ### Automated tests (Vitest)
 
 ```bash
-npm test               # ~170 tests, about a second
+npm test               # SQLite + unit tests; DynamoDB tests are skipped without DynamoDB Local
+
+# Full suite including the DynamoDB contract tests (what CI runs):
+docker run -d --rm -p 8000:8000 amazon/dynamodb-local -jar DynamoDBLocal.jar -inMemory
+DYNAMODB_ENDPOINT=http://localhost:8000 npm test   # ~245 tests
 npm run test:coverage  # same, plus coverage report (coverage/index.html); CI fails below the floor
 ```
 
 The suite is layered so each kind of failure shows up in exactly one place:
 
-| Layer                 | File(s)                                     | What it proves                                                                                                  |
-| --------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| Repository contract   | `tests/db/repositoryContract.ts`            | Behaviour any storage backend must have: filters, ordering, partial updates, cascades, search escaping, summary |
-| SQLite specifics      | `tests/db/sqliteRepository.test.ts`         | File persistence, migrations, foreign keys, `CHECK` constraints                                                 |
-| Models                | `tests/models/models.test.ts`               | Label normalisation, limit clamping, the full status-transition matrix, config validation                       |
-| Tool handlers         | `tests/tools/tools.test.ts`                 | Each tool's happy path and failure modes (not found, illegal transition, delete without confirm)                |
-| Error mapping         | `tests/tools/runTool.test.ts`               | `AppError` → `isError` with code; unexpected errors never leak details                                          |
-| Input validation      | `tests/tools/schemas.test.ts`               | Size limits, trimming, enums: the guardrail between the LLM and the database                                    |
-| Prompts and resources | `tests/prompts/`, `tests/resources/`        | Weekly window maths, report grouping, triage content, injection data blocks, workflow docs                      |
-| Protocol              | `tests/server.test.ts`                      | A real MCP `Client` over `InMemoryTransport`: listing, JSON Schema descriptions, SDK validation                 |
-| HTTP transport        | `tests/http/httpApp.test.ts`                | Auth, 413/400/404/405/429, Host check, stateless MCP over HTTP, request-id correlated logs (supertest)          |
-| HTTP config and auth  | `tests/http/config.test.ts`, `auth.test.ts` | Required/minimum-length API key (never echoed), bearer parsing, constant-time compare                           |
-| Logging               | `tests/lib/`                                | JSON shape, levels, redaction; every tool call logged with outcome/code, arguments never logged                 |
+| Layer                 | File(s)                                     | What it proves                                                                                                        |
+| --------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Repository contract   | `tests/db/repositoryContract.ts`            | Behaviour any storage backend must have: filters, ordering, partial updates, cascades, search escaping, summary       |
+| SQLite specifics      | `tests/db/sqliteRepository.test.ts`         | File persistence, migrations, foreign keys, `CHECK` constraints                                                       |
+| Models                | `tests/models/models.test.ts`               | Label normalisation, limit clamping, the full status-transition matrix, config validation                             |
+| Tool handlers         | `tests/tools/tools.test.ts`                 | Each tool's happy path and failure modes (not found, illegal transition, delete without confirm)                      |
+| Error mapping         | `tests/tools/runTool.test.ts`               | `AppError` → `isError` with code; unexpected errors never leak details                                                |
+| Input validation      | `tests/tools/schemas.test.ts`               | Size limits, trimming, enums: the guardrail between the LLM and the database                                          |
+| Prompts and resources | `tests/prompts/`, `tests/resources/`        | Weekly window maths, report grouping, triage content, injection data blocks, workflow docs                            |
+| Protocol              | `tests/server.test.ts`                      | A real MCP `Client` over `InMemoryTransport`: listing, JSON Schema descriptions, SDK validation                       |
+| HTTP transport        | `tests/http/httpApp.test.ts`                | Auth, 413/400/404/405/429, Host check, stateless MCP over HTTP, request-id correlated logs (supertest)                |
+| HTTP config and auth  | `tests/http/config.test.ts`, `auth.test.ts` | Required/minimum-length API key (never echoed), bearer parsing, constant-time compare                                 |
+| Logging               | `tests/lib/`                                | JSON shape, levels, redaction; every tool call logged with outcome/code, arguments never logged                       |
+| DynamoDB              | `tests/db/dynamoRepository.test.ts`         | The same contract against DynamoDB Local (twice: default and 1-item pages), 25+ item batch delete, factory            |
+| Lambda                | `tests/lambda.test.ts`                      | API Gateway v2 events → handler: auth, tools, 413 on pre-read bodies, client IP, SSM key loading, cold-start retry    |
+| Infrastructure        | `infra/test/stacks.test.ts`                 | Template: on-demand table + GSIs + PITR + retain, Node 22/arm64, no secret in env, scoped IAM, throttling, OIDC trust |
 
 Design choices worth knowing:
 
@@ -345,8 +406,7 @@ Design choices worth knowing:
   suite runs in under a second) and catches real SQL bugs that mocks would hide.
 - **Deterministic time.** A controllable clock is injected into the repository and prompts, so
   ordering and "this week" logic never depend on when the tests run.
-- **A contract suite.** `describeRepositoryContract()` takes a factory, so the DynamoDB repository in
-  phase 5 must pass the same tests. That's the proof the backends are interchangeable.
+- **A contract suite.** `describeRepositoryContract()` takes a factory, so the DynamoDB repository must pass the same tests. That's the proof the backends are interchangeable.
 
 ### Manual testing with MCP Inspector
 
@@ -428,7 +488,7 @@ claude mcp add issue-tracker -- node /ABSOLUTE/PATH/TO/issue-tracker-mcp/dist/st
 
 ## Remote access: Streamable HTTP
 
-Run the same server over HTTP, so it can be reached from other machines or (phase 5) from AWS Lambda:
+Run the same server over HTTP, so it can be reached from other machines or from AWS Lambda:
 
 ```bash
 export MCP_API_KEY=$(openssl rand -hex 32)   # 64 hex chars; keep it secret
@@ -524,4 +584,232 @@ header if it's safe, generated otherwise, and returned in the response header.
 `authorization`, `apiKey`, `token`, `secret`, `password` or `cookie` are redacted at any depth as a
 safety net.
 
-_Sections still to come: AWS deployment and budget alert, interview talking points (phase 5)._
+## Storage on AWS: DynamoDB single-table design
+
+| Item    | `pk`         | `sk`                          | `gsi1pk` / `gsi1sk`           | `gsi2pk` / `gsi2sk`                    |
+| ------- | ------------ | ----------------------------- | ----------------------------- | -------------------------------------- |
+| Issue   | `ISSUE#<id>` | `META`                        | `ISSUES` / `<createdAt>#<id>` | `STATUS#<status>` / `<createdAt>#<id>` |
+| Comment | `ISSUE#<id>` | `COMMENT#<createdAt>#<cmtId>` | none                          | none                                   |
+
+| Access pattern                       | How                                                                         |
+| ------------------------------------ | --------------------------------------------------------------------------- |
+| Get issue                            | `GetItem(pk, META)`, strongly consistent                                    |
+| Issue's comments, oldest first       | `Query(pk, begins_with(sk, "COMMENT#"))`                                    |
+| List newest first (+ createdAfter)   | `Query gsi1`, `ScanIndexForward=false`, `gsi1sk >= createdAfter`            |
+| List by status                       | `Query gsi2` on `STATUS#<status>`: a key lookup, not a filter               |
+| Priority / assignee / label / search | `FilterExpression` on lower-cased copies, paging until enough matches       |
+| Delete issue + comments              | `Query(pk)` → `BatchWriteItem` in chunks of 25 (comments first, issue last) |
+| Add comment                          | `TransactWriteItems`: bump issue `updatedAt` (must exist) + put comment     |
+
+Limits worth knowing: `gsi1` keeps all issues in one partition, which is fine up to thousands of
+writes per second (shard the key beyond that). Search scans issues newest first with a filter, which is
+fine for thousands of issues; OpenSearch would be the upgrade. Listings come from GSIs, which are
+eventually consistent, so a just-created issue can take a moment to appear in `list_issues`.
+
+Run the server against DynamoDB Local:
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local -jar DynamoDBLocal.jar -sharedDb
+export STORAGE=dynamodb DYNAMODB_ENDPOINT=http://localhost:8000 DYNAMODB_TABLE=issues
+npm run dynamodb:create-table
+npm run dev:stdio   # or dev:http
+```
+
+## AWS deployment
+
+```mermaid
+flowchart LR
+  C[MCP client] -->|HTTPS<br/>Authorization: Bearer| G[API Gateway HTTP API<br/>throttle 10 rps / burst 20]
+  G -->|POST/GET/DELETE /mcp<br/>GET /health| L[Lambda<br/>Node 22 arm64, 512 MB]
+  L --> D[(DynamoDB<br/>on-demand, PITR)]
+  L -->|GetParameter<br/>WithDecryption| S[SSM Parameter Store<br/>SecureString API key]
+  L --> W[CloudWatch Logs<br/>JSON, 14 days]
+```
+
+### Prerequisites
+
+- An AWS account and the AWS CLI signed in (`aws sts get-caller-identity` should work), with
+  permissions to create the resources above (an admin role for the first deployment).
+- Node 22. Docker is **not** needed: esbuild bundles the Lambda locally.
+
+### 1. Set a budget alert first
+
+Do this before deploying anything, so a mistake can never surprise you on the bill. Either:
+
+- **Console:** Billing and Cost Management → Budgets → Create budget → _Monthly cost budget_ →
+  $10 → your email; or
+- **CLI:**
+
+  ```bash
+  ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+  aws budgets create-budget --account-id "$ACCOUNT_ID" \
+    --budget '{"BudgetName":"monthly-10-usd","BudgetLimit":{"Amount":"10","Unit":"USD"},"TimeUnit":"MONTHLY","BudgetType":"COST"}' \
+    --notifications-with-subscribers '[
+      {"Notification":{"NotificationType":"ACTUAL","ComparisonOperator":"GREATER_THAN","Threshold":80,"ThresholdType":"PERCENTAGE"},
+       "Subscribers":[{"SubscriptionType":"EMAIL","Address":"you@example.com"}]},
+      {"Notification":{"NotificationType":"FORECASTED","ComparisonOperator":"GREATER_THAN","Threshold":100,"ThresholdType":"PERCENTAGE"},
+       "Subscribers":[{"SubscriptionType":"EMAIL","Address":"you@example.com"}]}]'
+  ```
+
+- **Or with the stack:** add `-c budgetEmail=you@example.com` to `cdk deploy`, or set the
+  `BUDGET_EMAIL` variable for CI, and the stack creates the same budget.
+
+A budget **alerts**; it does not stop spending. The hard limits here are API Gateway throttling and
+on-demand pricing that is $0 when idle. Budgets cover the whole account, not just this project.
+
+### 2. Create the API key in SSM (once)
+
+```bash
+aws ssm put-parameter \
+  --name /issue-tracker-mcp/api-key \
+  --type SecureString \
+  --value "$(openssl rand -hex 32)"
+
+# Read it back when you need it for a client:
+aws ssm get-parameter --name /issue-tracker-mcp/api-key --with-decryption \
+  --query Parameter.Value --output text
+```
+
+CloudFormation can't create SecureString parameters. That's a good thing: the secret is created out
+of band and never passes through code or templates.
+
+### 3. Bootstrap CDK and deploy
+
+```bash
+cd infra
+npm ci
+npx cdk bootstrap                  # once per account/region
+npx cdk diff IssueTrackerMcp       # review what will be created
+npx cdk deploy IssueTrackerMcp     # ~2 minutes; prints McpEndpoint and HealthUrl
+```
+
+### 4. Try it
+
+```bash
+export MCP_URL=<McpEndpoint output>     # https://xxxx.execute-api.<region>.amazonaws.com/mcp
+export MCP_API_KEY=$(aws ssm get-parameter --name /issue-tracker-mcp/api-key --with-decryption \
+  --query Parameter.Value --output text)
+
+curl -s "${MCP_URL%/mcp}/health"
+curl -s "$MCP_URL" -H "Authorization: Bearer $MCP_API_KEY" -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+# Use it from Claude Code:
+claude mcp add --transport http issue-tracker-aws "$MCP_URL" \
+  --header "Authorization: Bearer $MCP_API_KEY"
+```
+
+### 5. Turn on continuous deployment (once)
+
+1. Deploy the OIDC stack, which creates the GitHub identity provider and a deploy role that can only
+   assume the CDK bootstrap roles:
+
+   ```bash
+   cd infra && npx cdk deploy IssueTrackerMcpGitHubOidc
+   ```
+
+   If your account already has a GitHub OIDC provider, add
+   `-c githubOidcProviderArn=arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com`.
+
+2. In GitHub, open **Settings → Environments → New environment** and name it `production`.
+   Optionally add yourself as a required reviewer, so every deploy waits for approval.
+3. In that environment, add these **variables** (not secrets; none of them are sensitive):
+   `AWS_DEPLOY_ROLE_ARN` (the `DeployRoleArn` output), `AWS_REGION`, and optionally `BUDGET_EMAIL`.
+4. Merge to `main`. `deploy.yml` runs CI, deploys and smoke-tests `/health`.
+
+### Operating it
+
+- **Logs:** CloudWatch → Logs Insights → log group `LogGroupName` (stack output):
+
+  ```text
+  fields @timestamp, tool, outcome, errorCode, durationMs
+  | filter event = "tool_call"
+  | stats count() as calls, avg(durationMs) as avgMs, max(durationMs) as maxMs by tool, outcome
+  ```
+
+- **Rotate the API key:** run `aws ssm put-parameter --name /issue-tracker-mcp/api-key --type
+SecureString --overwrite --value "$(openssl rand -hex 32)"`. Running containers cache the key, so
+  force fresh ones with any configuration change, e.g.
+  `aws lambda update-function-configuration --function-name <FunctionName> --description "key rotated $(date -u +%FT%TZ)"`.
+- **Tear down:** `cd infra && npx cdk destroy IssueTrackerMcp`. The table is **retained** on purpose;
+  delete it in the DynamoDB console when you're sure, along with the SSM parameter.
+
+## Cost
+
+Rough monthly cost for light personal or team use (about 10,000 MCP requests/month), using us-east-1
+list prices at the time of writing. Check the [AWS Pricing Calculator](https://calculator.aws/) for
+your region.
+
+| Service                         | Pricing model                                                  | Estimate       |
+| ------------------------------- | -------------------------------------------------------------- | -------------- |
+| API Gateway HTTP API            | about $1.00 per million requests                               | ~$0.01         |
+| Lambda (arm64, 512 MB)          | per request + GB-second; the always-free allowance covers this | $0             |
+| DynamoDB on-demand              | per read/write request + storage (first 25 GB free)            | < $0.05        |
+| DynamoDB point-in-time recovery | per GB-month of table size                                     | ~$0            |
+| CloudWatch Logs (14 days)       | about $0.50 per GB ingested                                    | < $0.05        |
+| SSM Parameter Store             | standard parameters are free                                   | $0             |
+| CDK bootstrap (S3 + ECR)        | storage for deployment assets                                  | < $0.10        |
+| **Total**                       |                                                                | **< $1/month** |
+
+What keeps it under $10 even if usage grows or the key leaks: API Gateway throttling (10 req/s,
+burst 20), no always-on compute, two-week log retention, and the budget alert.
+
+## Interview talking points
+
+**MCP fundamentals**
+
+- MCP has three primitives, each controlled by a different party: **tools** are chosen by the model,
+  **resources** are attached by the app or user, and **prompts** are picked by the user. I used each
+  for what it's good at: actions, read-only context, and reusable workflows.
+- Tool descriptions and `.describe()` texts are prompt engineering. They tell the model _when_ to use
+  a tool and which sibling to use instead, and errors come back as `isError` results with a hint
+  ("Allowed from closed: open") so the model can self-correct.
+- I designed for LLM ergonomics: short prefixed IDs, truncated list output (token budget), idempotent
+  `change_status`, and a `confirm: true` guardrail plus `destructiveHint` on delete.
+
+**Architecture**
+
+- One transport-agnostic `createServer()`, three entry points (stdio, HTTP, Lambda). Behaviour is
+  identical everywhere, and tests drive it through an in-memory transport.
+- The repository pattern with a **contract test suite**: SQLite and DynamoDB pass the same 30+
+  behavioural tests, which proves `STORAGE` really is a drop-in switch.
+- Stateless Streamable HTTP is the key to serverless: no session affinity, so any Lambda instance can
+  serve any request.
+
+**DynamoDB**
+
+- A single-table design driven by access patterns: issue and comments in one partition, two GSIs for
+  newest-first and by-status listing.
+- The subtle bug class: `Limit` applies _before_ `FilterExpression`. I page until enough matches are
+  collected, and test it with 1-item pages.
+- Explicit trade-offs: a hot partition at extreme scale, scan-based search, eventual consistency on
+  GSIs, and non-atomic large deletes ordered so that a retry is safe.
+
+**Security**
+
+- Defence in depth: constant-time API-key comparison, rate limiting _before_ auth, auth _before_
+  body parsing, size limits, Host-header validation, bound SQL parameters, and prompt-injection
+  framing for user-written text.
+- Secrets: the key lives in SSM SecureString and is read at runtime, never in code, templates, env
+  vars or logs. CI uses OIDC with a trust policy pinned to one repo and environment, so there are no
+  stored AWS keys.
+- Logging is metadata-only (tool, duration, outcome, error code) with secret redaction as a backstop.
+
+**Testing and delivery**
+
+- Tests are layered: contract, handler, protocol (real MCP client), HTTP (supertest), Lambda (real
+  API Gateway events) and infrastructure (template assertions), with coverage thresholds enforced in
+  CI.
+- One real bug found by testing the _bundled_ Lambda: serverless-express hands Express a pre-read
+  body, so `express.json()` silently skipped it, which also bypassed the body-size limit. I fixed it
+  with a middleware that parses the Buffer under the same limit, and added a regression test.
+- GitHub Flow with one PR per phase; `main` deploys automatically after CI, through a protected
+  environment.
+
+**What I'd do next**
+
+- OAuth 2.1 per the MCP authorization spec (per-user identity and scopes) instead of a shared key.
+- A status-history table, so "resolved this week" is exact.
+- Full-text search (OpenSearch) and counters maintained via DynamoDB Streams, if scale demands it.
+- A custom domain, AWS WAF, and alarms on Lambda errors and throttles.

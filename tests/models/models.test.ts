@@ -79,9 +79,32 @@ describe('loadConfig', () => {
   });
 
   it('reads explicit values', () => {
+    expect(loadConfig({ SQLITE_PATH: ':memory:', LOG_LEVEL: 'debug' })).toEqual({
+      storage: 'sqlite',
+      sqlitePath: ':memory:',
+      logLevel: 'debug',
+    });
+  });
+
+  it('reads DynamoDB settings', () => {
     expect(
-      loadConfig({ STORAGE: 'dynamodb', SQLITE_PATH: ':memory:', LOG_LEVEL: 'debug' }),
-    ).toEqual({ storage: 'dynamodb', sqlitePath: ':memory:', logLevel: 'debug' });
+      loadConfig({
+        STORAGE: 'dynamodb',
+        DYNAMODB_TABLE: 'issues',
+        DYNAMODB_ENDPOINT: 'http://localhost:8000',
+        AWS_REGION: 'eu-west-1',
+      }).dynamodb,
+    ).toEqual({ tableName: 'issues', endpoint: 'http://localhost:8000', region: 'eu-west-1' });
+  });
+
+  it('requires DYNAMODB_TABLE when STORAGE=dynamodb', () => {
+    expect(() => loadConfig({ STORAGE: 'dynamodb' })).toThrow(/DYNAMODB_TABLE is required/);
+  });
+
+  it('rejects an invalid DYNAMODB_ENDPOINT', () => {
+    expect(() =>
+      loadConfig({ STORAGE: 'dynamodb', DYNAMODB_TABLE: 'issues', DYNAMODB_ENDPOINT: 'nope' }),
+    ).toThrow(/DYNAMODB_ENDPOINT/);
   });
 
   it('fails fast with a readable error on an invalid STORAGE value', () => {

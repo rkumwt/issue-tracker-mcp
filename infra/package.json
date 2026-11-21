@@ -1,0 +1,30 @@
+{
+  "name": "issue-tracker-mcp-infra",
+  "version": "0.5.0",
+  "description": "AWS CDK infrastructure for the Issue Tracker MCP server (Lambda + API Gateway + DynamoDB).",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "synth": "cdk synth",
+    "diff": "cdk diff IssueTrackerMcp",
+    "deploy": "cdk deploy IssueTrackerMcp",
+    "deploy:oidc": "cdk deploy IssueTrackerMcpGitHubOidc",
+    "destroy": "cdk destroy IssueTrackerMcp"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.278.0",
+    "constructs": "^10.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "aws-cdk": "^2.1149.0",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9"
+  }
+}
