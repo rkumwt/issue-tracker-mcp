@@ -37,6 +37,8 @@ new GitHubOidcStack(app, 'IssueTrackerMcpGitHubOidc', {
   description: 'GitHub Actions OIDC deploy role for the Issue Tracker MCP server',
   repository: context('githubRepository') ?? 'rkumwt/issue-tracker-mcp',
   environment: context('githubEnvironment') ?? 'production',
+  ownerId: context('githubOwnerId'),
+  repositoryId: context('githubRepositoryId'),
   existingProviderArn: context('githubOidcProviderArn'),
 });
 

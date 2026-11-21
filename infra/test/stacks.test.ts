@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { App } from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
-import { GitHubOidcStack } from '../lib/github-oidc-stack.js';
+import { GitHubOidcStack, githubSubject } from '../lib/github-oidc-stack.js';
 import { IssueTrackerStack } from '../lib/issue-tracker-stack.js';
 
 const env = { account: '123456789012', region: 'eu-west-1' };
@@ -117,6 +117,8 @@ describe('GitHubOidcStack', () => {
       env,
       repository: 'owner/repo',
       environment: 'production',
+      ownerId: '111',
+      repositoryId: '222',
     }),
   );
 
@@ -129,13 +131,32 @@ describe('GitHubOidcStack', () => {
             Condition: {
               StringEquals: {
                 'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-                'token.actions.githubusercontent.com:sub': 'repo:owner/repo:environment:production',
+                'token.actions.githubusercontent.com:sub':
+                  'repo:owner@111/repo@222:environment:production',
               },
             },
           }),
         ],
       },
     });
+  });
+
+  it('builds ID-based subjects (what GitHub sends today) and the legacy name-only form', () => {
+    assert.equal(
+      githubSubject({
+        repository: 'rkumwt/issue-tracker-mcp',
+        environment: 'production',
+        ownerId: '21355037',
+        repositoryId: '1465100792',
+      }),
+      // Exactly the userName CloudTrail recorded for the rejected deploy.
+      'repo:rkumwt@21355037/issue-tracker-mcp@1465100792:environment:production',
+    );
+    assert.equal(
+      githubSubject({ repository: 'owner/repo', environment: 'production' }),
+      'repo:owner/repo:environment:production',
+    );
+    assert.throws(() => githubSubject({ repository: 'no-slash', environment: 'production' }));
   });
 
   it('can only assume the CDK bootstrap roles', () => {
