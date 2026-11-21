@@ -399,6 +399,7 @@ The suite is layered so each kind of failure shows up in exactly one place:
 | DynamoDB              | `tests/db/dynamoRepository.test.ts`         | The same contract against DynamoDB Local (twice: default and 1-item pages), 25+ item batch delete, factory            |
 | Lambda                | `tests/lambda.test.ts`                      | API Gateway v2 events → handler: auth, tools, 413 on pre-read bodies, client IP, SSM key loading, cold-start retry    |
 | Infrastructure        | `infra/test/stacks.test.ts`                 | Template: on-demand table + GSIs + PITR + retain, Node 22/arm64, no secret in env, scoped IAM, throttling, OIDC trust |
+| Lambda bundle         | `infra/test/bundle.test.ts`                 | The bundled `index.mjs` loads and serves `/health` from an empty directory, with no `node_modules` (like `/var/task`) |
 
 Design choices worth knowing:
 
@@ -804,6 +805,12 @@ burst 20), no always-on compute, two-week log retention, and the budget alert.
 - One real bug found by testing the _bundled_ Lambda: serverless-express hands Express a pre-read
   body, so `express.json()` silently skipped it, which also bypassed the body-size limit. I fixed it
   with a middleware that parses the Buffer under the same limit, and added a regression test.
+- A second one found only by the **first real deployment**: esbuild hoisted the lazily-loaded SQLite
+  module's `import 'better-sqlite3'` to the top of the single-file bundle, so Lambda crashed at init
+  with `ERR_MODULE_NOT_FOUND`. My local bundle test had passed because Node quietly resolved the
+  package from the repo's `node_modules`. The fix loads the native driver lazily via `createRequire`,
+  and the new `infra/test/bundle.test.ts` imports the bundle from an empty temp directory (like
+  `/var/task`). It fails without the fix and passes with it. Lesson: test artifacts in isolation.
 - GitHub Flow with one PR per phase; `main` deploys automatically after CI, through a protected
   environment.
 
