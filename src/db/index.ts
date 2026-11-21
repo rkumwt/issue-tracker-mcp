@@ -18,8 +18,12 @@ export async function createRepository(config: AppConfig): Promise<IssueReposito
       const { SqliteIssueRepository } = await import('./sqlite/SqliteIssueRepository.js');
       return SqliteIssueRepository.open(config.sqlitePath);
     }
-    case 'dynamodb':
-      // Implemented in phase 5.
-      throw new ConfigError('STORAGE=dynamodb is not implemented yet (coming in phase 5).');
+    case 'dynamodb': {
+      // loadConfig() guarantees this for STORAGE=dynamodb; checked again for type safety.
+      if (!config.dynamodb)
+        throw new ConfigError('DYNAMODB_TABLE is required when STORAGE=dynamodb');
+      const { DynamoIssueRepository } = await import('./dynamodb/DynamoIssueRepository.js');
+      return DynamoIssueRepository.create(config.dynamodb);
+    }
   }
 }

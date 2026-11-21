@@ -26,11 +26,22 @@ const DEFAULT_SQLITE_PATH = fileURLToPath(new URL('../data/issues.db', import.me
 /** Minimum API key length: forces something generated, not "secret123". */
 export const MIN_API_KEY_LENGTH = 32;
 
-const ConfigSchema = z.object({
-  STORAGE: z.enum(['sqlite', 'dynamodb']).default('sqlite'),
-  SQLITE_PATH: z.string().min(1).default(DEFAULT_SQLITE_PATH),
-  LOG_LEVEL: z.enum(LOG_LEVELS).default('info'),
-});
+const ConfigSchema = z
+  .object({
+    STORAGE: z.enum(['sqlite', 'dynamodb']).default('sqlite'),
+    SQLITE_PATH: z.string().min(1).default(DEFAULT_SQLITE_PATH),
+    LOG_LEVEL: z.enum(LOG_LEVELS).default('info'),
+    /** DynamoDB table name (required when STORAGE=dynamodb). */
+    DYNAMODB_TABLE: z.string().min(3).max(255).optional(),
+    /** DynamoDB Local endpoint for development, e.g. http://localhost:8000. Unset on AWS. */
+    DYNAMODB_ENDPOINT: z.url().optional(),
+    /** Set automatically by Lambda; needed locally only with real AWS. */
+    AWS_REGION: z.string().min(1).optional(),
+  })
+  .refine((env) => env.STORAGE !== 'dynamodb' || env.DYNAMODB_TABLE !== undefined, {
+    message: 'DYNAMODB_TABLE is required when STORAGE=dynamodb',
+    path: ['DYNAMODB_TABLE'],
+  });
 
 const HttpConfigSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
@@ -51,6 +62,11 @@ export interface AppConfig {
   storage: 'sqlite' | 'dynamodb';
   sqlitePath: string;
   logLevel: LogLevel;
+  dynamodb?: {
+    tableName: string;
+    endpoint?: string | undefined;
+    region?: string | undefined;
+  };
 }
 
 export interface HttpConfig {
@@ -77,7 +93,18 @@ function parseEnv<T extends z.ZodType>(schema: T, env: NodeJS.ProcessEnv): z.out
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const data = parseEnv(ConfigSchema, env);
-  return { storage: data.STORAGE, sqlitePath: data.SQLITE_PATH, logLevel: data.LOG_LEVEL };
+  return {
+    storage: data.STORAGE,
+    sqlitePath: data.SQLITE_PATH,
+    logLevel: data.LOG_LEVEL,
+    ...(data.DYNAMODB_TABLE !== undefined && {
+      dynamodb: {
+        tableName: data.DYNAMODB_TABLE,
+        endpoint: data.DYNAMODB_ENDPOINT,
+        region: data.AWS_REGION,
+      },
+    }),
+  };
 }
 
 export function loadHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig {

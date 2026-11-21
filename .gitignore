@@ -3,6 +3,7 @@ dist/
 coverage/
 .aws-sam/
 infra/cdk.out/
+infra/cdk-outputs.json
 
 # Local SQLite database files
 data/

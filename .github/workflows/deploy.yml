@@ -1,0 +1,85 @@
+# Continuous Deployment: every push to main → verify → deploy to AWS.
+#
+#   push to main ──▶ CI (reusable ci.yml) ──▶ deploy (environment: production)
+#                                               ├─ assume AWS role via OIDC (no stored keys)
+#                                               ├─ cdk deploy IssueTrackerMcp
+#                                               └─ smoke test GET /health
+#
+# One-time setup (see README "AWS deployment"):
+#   1. Bootstrap CDK and deploy the IssueTrackerMcpGitHubOidc stack.
+#   2. In GitHub: Settings → Environments → "production", add variables
+#        AWS_DEPLOY_ROLE_ARN  (output of the OIDC stack)
+#        AWS_REGION           (e.g. eu-west-1)
+#        BUDGET_EMAIL         (optional: monthly budget alert recipient)
+#      and optionally require a reviewer before deploys.
+# Until AWS_DEPLOY_ROLE_ARN is set, the deploy job is skipped (CI still runs).
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # manual "Run workflow" button
+
+permissions:
+  contents: read
+
+# Never run two deployments at once, and never cancel one half-way.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Deploy to AWS
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    if: ${{ vars.AWS_DEPLOY_ROLE_ARN != '' }}
+    permissions:
+      contents: read
+      id-token: write # lets the job request a GitHub OIDC token for AWS
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            infra/package-lock.json
+
+      - run: npm ci
+      - run: npm ci
+        working-directory: infra
+
+      # Short-lived credentials (1 hour) via OIDC: no AWS keys stored in GitHub.
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: github-deploy-${{ github.run_id }}
+
+      - name: Deploy
+        working-directory: infra
+        run: >
+          npx cdk deploy IssueTrackerMcp
+          --require-approval never
+          --outputs-file cdk-outputs.json
+          ${{ vars.BUDGET_EMAIL != '' && format('-c budgetEmail={0}', vars.BUDGET_EMAIL) || '' }}
+
+      - name: Smoke test
+        working-directory: infra
+        run: |
+          url=$(node -p "require('./cdk-outputs.json').IssueTrackerMcp.HealthUrl")
+          echo "Checking $url"
+          curl --fail --silent --show-error --retry 3 --retry-delay 5 "$url"
+          echo
+          {
+            echo "### Deployed :rocket:"
+            echo "MCP endpoint: \`$(node -p "require('./cdk-outputs.json').IssueTrackerMcp.McpEndpoint")\`"
+          } >> "$GITHUB_STEP_SUMMARY"

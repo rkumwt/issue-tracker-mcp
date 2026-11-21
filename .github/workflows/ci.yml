@@ -1,13 +1,16 @@
-# Continuous Integration: runs on every push and pull request.
-# It only verifies code quality and never deploys. Deployment lives in a
-# separate workflow (phase 5) that runs only on main.
+# Continuous Integration: verifies code quality and never deploys.
+#
+# Runs on pull requests and on pushes to feature branches. Pushes to main run
+# it through deploy.yml instead (`workflow_call`), so main is verified exactly
+# once and deployment only starts after these checks pass.
 name: CI
 
 on:
   push:
-    branches: ['**']
+    branches-ignore: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
 # Least privilege: CI only needs to read the repository.
 permissions:
@@ -15,7 +18,7 @@ permissions:
 
 # A new push to the same branch cancels the run that is still in progress.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -23,6 +26,16 @@ jobs:
     name: Lint, typecheck, test, build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
+    # DynamoDB Local, so the repository contract tests also run against DynamoDB.
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:latest
+        ports: ['8000:8000']
+
+    env:
+      DYNAMODB_ENDPOINT: http://localhost:8000
+
     steps:
       - uses: actions/checkout@v7
 
@@ -43,8 +56,45 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Unit tests with coverage (fails below thresholds)
+      - name: Unit tests with coverage (SQLite + DynamoDB Local; fails below thresholds)
         run: npm run test:coverage
 
       - name: Build
         run: npm run build
+
+  infra:
+    name: Infrastructure (typecheck, template tests, synth)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            infra/package-lock.json
+
+      # The Lambda bundle is built from the app's dependencies, so both installs are needed.
+      - run: npm ci
+      - run: npm ci
+        working-directory: infra
+
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: infra
+
+      - name: CloudFormation template tests
+        run: npm test
+        working-directory: infra
+
+      # Synth needs no AWS credentials; it proves the app bundles and the
+      # templates are valid before anything is deployed.
+      - name: Synth
+        run: npx cdk synth --quiet
+        working-directory: infra
+        env:
+          CDK_DEFAULT_ACCOUNT: '123456789012'
+          CDK_DEFAULT_REGION: us-east-1

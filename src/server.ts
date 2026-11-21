@@ -16,7 +16,7 @@ import { registerResources } from './resources/index.js';
 import { registerTools } from './tools/index.js';
 
 export const SERVER_NAME = 'issue-tracker-mcp';
-export const SERVER_VERSION = '0.4.0';
+export const SERVER_VERSION = '0.5.0';
 
 /**
  * Sent to the client during initialisation. Many clients add it to the system
