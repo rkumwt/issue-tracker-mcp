@@ -12,7 +12,11 @@
 #        AWS_REGION           (e.g. eu-west-1)
 #        BUDGET_EMAIL         (optional: monthly budget alert recipient)
 #      and optionally require a reviewer before deploys.
-# Until AWS_DEPLOY_ROLE_ARN is set, the deploy job is skipped (CI still runs).
+# Until that is done the deploy job fails at the credentials step (CI still
+# runs and passes). It is deliberately NOT guarded with
+# `if: vars.AWS_DEPLOY_ROLE_ARN != ''`: a job-level `if` is evaluated before
+# the job enters its environment, so ENVIRONMENT variables are always empty
+# there and the job would be skipped forever.
 name: Deploy
 
 on:
@@ -38,7 +42,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: production
-    if: ${{ vars.AWS_DEPLOY_ROLE_ARN != '' }}
     permissions:
       contents: read
       id-token: write # lets the job request a GitHub OIDC token for AWS

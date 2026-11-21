@@ -362,8 +362,9 @@ flowchart LR
 - [`deploy.yml`](.github/workflows/deploy.yml) runs on every push to `main`. It runs CI first, then
   the deploy job in the `production` GitHub Environment: it assumes the AWS role through OIDC, runs
   `cdk deploy`, smoke-tests `/health`, and writes the endpoint to the run summary. Deployments never
-  run concurrently and are never cancelled half-way. The deploy job is skipped until
-  `AWS_DEPLOY_ROLE_ARN` is configured, so the repository works without AWS.
+  run concurrently and are never cancelled half-way. Until the `production` environment is
+  configured (step 5 of "AWS deployment"), the deploy job fails at the credentials step while CI still
+  passes.
 
 Branching follows GitHub Flow: one short-lived branch per phase (`2-mcp-tools-stdio`, …), a pull request
 into `main`, CI must pass, then squash merge.
@@ -811,6 +812,10 @@ burst 20), no always-on compute, two-week log retention, and the budget alert.
   package from the repo's `node_modules`. The fix loads the native driver lazily via `createRequire`,
   and the new `infra/test/bundle.test.ts` imports the bundle from an empty temp directory (like
   `/var/task`). It fails without the fix and passes with it. Lesson: test artifacts in isolation.
+- A CI/CD gotcha: I first guarded the deploy job with `if: vars.AWS_DEPLOY_ROLE_ARN != ''`, which
+  skipped it forever. A job-level `if` is evaluated before the job enters its environment, so
+  environment-scoped variables are always empty there. Caught on the first merge by checking the job
+  had actually run, not just that the workflow was green.
 - GitHub Flow with one PR per phase; `main` deploys automatically after CI, through a protected
   environment.
 
